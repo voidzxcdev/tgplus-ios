@@ -1,0 +1,114 @@
+# TGPlus iOS: unsigned (fake-signed) Telegram IPA for Sideloadly.
+# Phase 1: clean upstream build of this branch (upstream master, app 13.1.2, Xcode 27.1).
+workflows:
+  tgplus-ios-unsigned:
+    name: TGPlus iOS unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 27.1
+      vars:
+        BUILD_CONFIGURATION: release_arm64
+        # Stop bazel after this many minutes so the build still "succeeds" and Codemagic saves the cache;
+        # the next build then resumes from the Bazel disk cache.
+        BAZEL_BUDGET_MIN: 95
+    cache:
+      cache_paths:
+        - $HOME/cmcache
+    scripts:
+      - name: Info
+        script: |
+          echo "BUILD_START=$(date +%s)" >> $CM_ENV
+          xcodebuild -version; sysctl -n hw.ncpu hw.memsize; df -h /; python3 --version
+          ls -la $HOME/cmcache 2>/dev/null || echo "no cache"
+      - name: Submodules
+        script: |
+          git config --global url."https://github.com/TelegramMessenger/rlottie.git".insteadOf "https://github.com/voidzxcdev/rlottie.git"
+          git config --global url."https://github.com/TelegramMessenger/tgcalls.git".insteadOf "https://github.com/voidzxcdev/tgcalls.git"
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1 --jobs 8 || git submodule update --init --recursive --jobs 8
+          git submodule status --recursive | cut -c1-90
+      - name: Restore Bazel disk cache
+        script: |
+          mkdir -p $HOME/bazel-cache $HOME/cmcache
+          if [ -f $HOME/cmcache/bazel-cache.tar.zst ]; then
+            ls -la $HOME/cmcache
+            tar -C $HOME --zstd -xf $HOME/cmcache/bazel-cache.tar.zst && du -sh $HOME/bazel-cache
+          fi
+      - name: Prepare configuration
+        script: |
+          python3 - <<'PY'
+          import json, os
+          c = json.load(open('build-system/appstore-configuration.json'))
+          if os.environ.get('TG_API_ID') and os.environ.get('TG_API_HASH'):
+              c['api_id'] = os.environ['TG_API_ID']; c['api_hash'] = os.environ['TG_API_HASH']
+              print('Using api_id/api_hash from TG_API_ID/TG_API_HASH')
+          else:
+              print('WARNING: TG_API_ID/TG_API_HASH not set; using upstream appstore-configuration values')
+          c['enable_siri'] = False
+          c['enable_icloud'] = False
+          json.dump(c, open(os.path.expanduser('~/tg-configuration.json'), 'w'), indent=2)
+          PY
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+      - name: Build
+        script: |
+          set -x
+          BUILD_NUMBER=$(( $(cat build_number_offset) + 100000 + ${BUILD_NUMBER:-0} ))
+          echo "TG_BUILD_NUMBER=$BUILD_NUMBER" >> $CM_ENV
+          python3 -u build-system/Make/Make.py \
+            --cacheDir="$HOME/bazel-cache" \
+            build \
+            --configurationPath="$HOME/tg-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration="$BUILD_CONFIGURATION" \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath="$PWD/build/artifacts" > $HOME/bazel-build.log 2>&1 &
+          PID=$!
+          ELAPSED_MIN=$(( ($(date +%s) - BUILD_START) / 60 ))
+          LEFT=$(( BAZEL_BUDGET_MIN - ELAPSED_MIN ))
+          echo "bazel budget left: ${LEFT} min"
+          tail -f $HOME/bazel-build.log &
+          TAILPID=$!
+          END=$(( $(date +%s) + LEFT * 60 ))
+          while kill -0 $PID 2>/dev/null; do
+            if [ $(date +%s) -ge $END ]; then
+              echo "TGPLUS: budget reached, stopping bazel to save cache (partial build)"
+              pkill -INT -f "build-input/bazel-" || true
+              for i in $(seq 1 12); do kill -0 $PID 2>/dev/null || break; sleep 10; done
+              kill $PID 2>/dev/null || true
+              echo "TGPLUS_PARTIAL=1" >> $CM_ENV
+              break
+            fi
+            sleep 15
+          done
+          wait $PID; RC=$?
+          kill $TAILPID 2>/dev/null || true
+          echo "Make.py exit code: $RC"
+          grep -E "processes:|Elapsed time|INFO: Build completed|ERROR" $HOME/bazel-build.log | tail -20
+          if [ -f build/artifacts/Telegram.ipa ]; then exit 0; fi
+          if grep -q "TGPLUS_PARTIAL=1" $CM_ENV 2>/dev/null; then exit 0; fi
+          exit 1
+      - name: Save Bazel disk cache
+        script: |
+          du -sh $HOME/bazel-cache || true
+          rm -f $HOME/cmcache/bazel-cache.tar.zst
+          tar -C $HOME --zstd -cf $HOME/cmcache/bazel-cache.tar.zst bazel-cache
+          ls -la $HOME/cmcache
+      - name: Package IPAs
+        script: |
+          set -x
+          [ -f build/artifacts/Telegram.ipa ] || { echo "No IPA (partial build). Re-run to continue from cache."; exit 0; }
+          cd build/artifacts
+          mv Telegram.ipa TGPlus-iOS-full.ipa
+          rm -rf work && mkdir work && cd work
+          unzip -q ../TGPlus-iOS-full.ipa
+          ls Payload/Telegram.app/PlugIns || true
+          ls Payload/Telegram.app/Watch || true
+          rm -rf Payload/Telegram.app/PlugIns Payload/Telegram.app/Watch Payload/Telegram.app/Extensions
+          zip -qry ../TGPlus-iOS-noext.ipa Payload
+          cd .. && rm -rf work
+          shasum -a 256 *.ipa | tee SHA256SUMS.txt
+          ls -la
+    artifacts:
+      - build/artifacts/*.ipa
+      - build/artifacts/SHA256SUMS.txt
