@@ -55,6 +55,50 @@ workflows:
           json.dump(c, open(os.path.expanduser('~/tg-configuration.json'), 'w'), indent=2)
           PY
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          cat > $HOME/refresh_profiles.py <<'PYEOF'
+          # Re-issue the upstream fake provisioning profiles with a future ExpirationDate
+          # (upstream's expired 2026-10-30) and re-sign them with fake-codesigning/certs/SelfSigned.p12.
+          import datetime, os, plistlib, shutil, subprocess, sys
+          sys.path.insert(0, 'build-system/Make')
+          import GenerateProfiles as G
+
+          src = 'build-system/fake-codesigning'
+          dst = os.path.expanduser('~/fake-codesigning')
+          shutil.rmtree(dst, ignore_errors=True)
+          shutil.copytree(src, dst)
+          p12 = os.path.join(src, 'certs', 'SelfSigned.p12')
+          identity = G.get_signing_identity_from_p12(p12, '')
+          if not identity:
+              out = subprocess.run(['openssl', 'pkcs12', '-in', p12, '-passin', 'pass:', '-nokeys'], capture_output=True).stdout
+              subj = subprocess.run(['openssl', 'x509', '-noout', '-subject'], input=out, capture_output=True).stdout.decode()
+              identity = subj.split('CN')[-1].lstrip(' =').split(',')[0].split('/')[0].strip()
+          print('identity:', identity)
+          keychain = G.setup_temp_keychain(p12, '')
+          now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
+          try:
+              pdir = os.path.join(dst, 'profiles')
+              for name in sorted(os.listdir(pdir)):
+                  if not name.endswith('.mobileprovision'):
+                      continue
+                  path = os.path.join(pdir, name)
+                  raw = subprocess.run(['security', 'cms', '-D', '-i', path], capture_output=True, check=True).stdout
+                  pl = plistlib.loads(raw)
+                  print(name, 'old expiry', pl.get('ExpirationDate'))
+                  pl['CreationDate'] = now - datetime.timedelta(days=1)
+                  pl['ExpirationDate'] = now + datetime.timedelta(days=365)
+                  pl['TimeToLive'] = 366
+                  pl.pop('DER-Encoded-Profile', None)
+                  tmp = path + '.plist'
+                  with open(tmp, 'wb') as f:
+                      plistlib.dump(pl, f)
+                  subprocess.run(['security', 'cms', '-S', '-k', keychain, '-N', identity, '-i', tmp, '-o', path], check=True)
+                  os.unlink(tmp)
+                  chk = plistlib.loads(subprocess.run(['security', 'cms', '-D', '-i', path], capture_output=True, check=True).stdout)
+                  print(name, 'new expiry', chk['ExpirationDate'])
+          finally:
+              G.cleanup_temp_keychain(keychain)
+          PYEOF
+          python3 $HOME/refresh_profiles.py
       - name: Build
         script: |
           set -x
@@ -64,7 +108,7 @@ workflows:
             --cacheDir="$HOME/bazel-cache" \
             build \
             --configurationPath="$HOME/tg-configuration.json" \
-            --codesigningInformationPath=build-system/fake-codesigning \
+            --codesigningInformationPath="$HOME/fake-codesigning" \
             --configuration="$BUILD_CONFIGURATION" \
             --buildNumber="$BUILD_NUMBER" \
             --outputBuildArtifactsPath="$PWD/build/artifacts" > $HOME/bazel-build.log 2>&1 &
