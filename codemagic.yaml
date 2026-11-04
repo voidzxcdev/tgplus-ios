@@ -43,7 +43,13 @@ workflows:
       - name: Metal toolchain
         script: |
           xcrun -f metal 2>/dev/null && xcrun metal --version 2>/dev/null && exit 0
-          xcodebuild -downloadComponent MetalToolchain
+          for attempt in 1 2 3; do
+            xcodebuild -downloadComponent MetalToolchain || true
+            for i in $(seq 1 12); do
+              xcrun metal --version 2>/dev/null && exit 0
+              echo "metal not ready yet (attempt $attempt, wait $i)"; sleep 10
+            done
+          done
           xcrun metal --version
       - name: Prepare configuration
         script: |
