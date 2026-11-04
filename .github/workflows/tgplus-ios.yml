@@ -12,9 +12,9 @@ concurrency:
 
 jobs:
   build:
-    # The xcode-27 label was never acquired by a hosted runner for this account (2 attempts),
-    # so build upstream 13.0.1 (14a2ebfc46), whose versions.json asks for Xcode 26.6, on macos-26.
-    runs-on: macos-26
+    # macOS arm64 runners (xcode-27, macos-26) were never acquired ("capacity constraints"),
+    # so build upstream 13.0.1 (14a2ebfc46, versions.json: Xcode 26.6) on the Intel macOS 26 runner.
+    runs-on: macos-26-intel
     env:
       UPSTREAM_REF: 14a2ebfc4632055855d49926e31f2b0c6d6e8edc
       XCODE_APP: /Applications/Xcode_26.6.app
@@ -94,7 +94,13 @@ jobs:
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
           echo "APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')" >> $GITHUB_ENV
           mkdir -p "$HOME/bazel-cache"
+          # Make.py only pins the arm64 bazel SHA, so fetch the host-arch binary ourselves.
+          BAZEL_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["bazel"].split(":")[0])')
+          case "$(uname -m)" in arm64) BARCH=darwin-arm64 ;; *) BARCH=darwin-x86_64 ;; esac
+          curl -fsSL -o "$HOME/bazel" "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-$BARCH"
+          chmod +x "$HOME/bazel" && "$HOME/bazel" --version
           python3 -u build-system/Make/Make.py \
+            --bazel="$HOME/bazel" \
             --cacheDir="$HOME/bazel-cache" \
             build \
             --configurationPath="$HOME/tg-configuration.json" \
