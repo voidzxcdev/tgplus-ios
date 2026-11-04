@@ -12,31 +12,36 @@ concurrency:
 
 jobs:
   build:
-    # Xcode 27.1 (versions.json) is the default Xcode on this image.
-    runs-on: xcode-27
+    # The xcode-27 label was never acquired by a hosted runner for this account (2 attempts),
+    # so build upstream 13.0.1 (14a2ebfc46), whose versions.json asks for Xcode 26.6, on macos-26.
+    runs-on: macos-26
+    env:
+      UPSTREAM_REF: 14a2ebfc4632055855d49926e31f2b0c6d6e8edc
+      XCODE_APP: /Applications/Xcode_26.6.app
     timeout-minutes: 355
     steps:
       - name: Free disk space
         run: |
           df -h /
-          # Keep only Xcode 27.1; drop other Xcodes and unused simulator runtimes.
+          # Keep only the selected Xcode; drop other Xcodes and unused simulator runtimes.
           for x in /Applications/Xcode_*.app; do
             real=$(cd "$x" && pwd -P)
-            case "$real" in */Xcode_27.1.app) ;; *) echo "removing $x"; sudo rm -rf "$x" ;; esac
+            keep=$(cd "$XCODE_APP" && pwd -P)
+            case "$real" in "$keep") ;; *) echo "removing $x"; sudo rm -rf "$x" ;; esac
           done
-          xcrun simctl runtime delete all 2>/dev/null || true
           sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet ~/.ghcup /usr/local/lib/node_modules \
             ~/Library/Developer/CoreSimulator/Caches /Library/Developer/CoreSimulator/Images 2>/dev/null || true
           df -h /
 
-      - name: Select Xcode 27.1
+      - name: Select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           xcodebuild -version
           sysctl -n hw.ncpu hw.memsize
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.UPSTREAM_REF }}
           submodules: false
           fetch-depth: 1
 
