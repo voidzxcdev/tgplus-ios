@@ -1,0 +1,13 @@
+name: runner probe
+on:
+  push:
+    branches: [tgplus-ios/probe]
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15, macos-15-intel, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: uname -a; sw_vers || true; ls /Applications | grep -i xcode || true
