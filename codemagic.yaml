@@ -35,6 +35,11 @@ workflows:
             ls -la $HOME/cmcache
             tar -C $HOME --zstd -xf $HOME/cmcache/bazel-cache.tar.zst && du -sh $HOME/bazel-cache
           fi
+      - name: Metal toolchain
+        script: |
+          xcrun -f metal 2>/dev/null && xcrun metal --version 2>/dev/null && exit 0
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun metal --version
       - name: Prepare configuration
         script: |
           python3 - <<'PY'
