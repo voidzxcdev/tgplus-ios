@@ -21,6 +21,11 @@ workflows:
           echo "BUILD_START=$(date +%s)" >> $CM_ENV
           xcodebuild -version; sysctl -n hw.ncpu hw.memsize; df -h /; python3 --version
           ls -la $HOME/cmcache 2>/dev/null || echo "no cache"
+          # td's CMake picks up ccache via find_program but then runs bare `ccache` under bazel's
+          # restricted PATH (/bin:/usr/bin:/usr/local/bin) -> "ccache: command not found". Hide it.
+          brew uninstall --ignore-dependencies --force ccache 2>/dev/null || true
+          for p in $(which -a ccache 2>/dev/null); do sudo rm -f "$p"; done
+          which ccache || echo "ccache removed"
       - name: Submodules
         script: |
           git config --global url."https://github.com/TelegramMessenger/rlottie.git".insteadOf "https://github.com/voidzxcdev/rlottie.git"
