@@ -65,7 +65,6 @@ workflows:
           c['enable_icloud'] = False
           json.dump(c, open(os.path.expanduser('~/tg-configuration.json'), 'w'), indent=2)
           PY
-          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           cat > $HOME/refresh_profiles.py <<'PYEOF'
           # Re-issue the upstream fake provisioning profiles with a future ExpirationDate
           # (upstream's expired 2026-10-30) and re-sign them with fake-codesigning/certs/SelfSigned.p12.
@@ -110,6 +109,21 @@ workflows:
               G.cleanup_temp_keychain(keychain)
           PYEOF
           python3 $HOME/refresh_profiles.py
+          # Import certs AFTER re-issuing profiles: GenerateProfiles' temp keychain resets the search list.
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          security list-keychains -d user
+          security find-identity -p codesigning | tee $HOME/identities.txt
+          security cms -D -i $HOME/fake-codesigning/profiles/Telegram.mobileprovision > $HOME/tp.plist
+          python3 - <<'PY2'
+          import plistlib, hashlib, os, sys
+          pl = plistlib.load(open(os.path.expanduser('~/tp.plist'), 'rb'))
+          ids = open(os.path.expanduser('~/identities.txt')).read()
+          want = [hashlib.sha1(c).hexdigest().upper() for c in pl['DeveloperCertificates']]
+          print('profile cert sha1:', want)
+          if not any(w in ids for w in want):
+              print('ERROR: signing identity for profile not in keychain'); sys.exit(1)
+          print('signing identity OK')
+          PY2
       - name: Build
         script: |
           set -x
@@ -147,7 +161,11 @@ workflows:
           grep -E "processes:|Elapsed time|INFO: Build completed|ERROR" $HOME/bazel-build.log | tail -20
           if [ -f build/artifacts/Telegram.ipa ]; then exit 0; fi
           if grep -q "TGPLUS_PARTIAL=1" $CM_ENV 2>/dev/null; then exit 0; fi
-          exit 1
+          # Bazel failed: keep the workflow green so Codemagic still persists the disk cache
+          # (cache is only saved on successful builds); the failure is reported via TGPLUS_FAILED.
+          echo "TGPLUS_FAILED=1" >> $CM_ENV
+          echo "TGPLUS: BAZEL BUILD FAILED (see errors above); continuing only to save cache"
+          exit 0
       - name: Save Bazel disk cache
         script: |
           du -sh $HOME/bazel-cache || true
