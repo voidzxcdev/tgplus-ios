@@ -1,0 +1,192 @@
+# TGPlus iOS: unsigned (fake-signed) Telegram IPA for Sideloadly.
+# Phase 1: clean upstream build of this branch (upstream master, app 13.1.2, Xcode 27.1).
+workflows:
+  tgplus-ios-unsigned:
+    name: TGPlus iOS unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 27.1
+      vars:
+        BUILD_CONFIGURATION: release_arm64
+        # Stop bazel after this many minutes so the build still "succeeds" and Codemagic saves the cache;
+        # the next build then resumes from the Bazel disk cache.
+        BAZEL_BUDGET_MIN: 95
+    cache:
+      cache_paths:
+        - $HOME/cmcache
+    scripts:
+      - name: Info
+        script: |
+          echo "BUILD_START=$(date +%s)" >> $CM_ENV
+          xcodebuild -version; sysctl -n hw.ncpu hw.memsize; df -h /; python3 --version
+          ls -la $HOME/cmcache 2>/dev/null || echo "no cache"
+          # td's CMake picks up ccache via find_program but then runs bare `ccache` under bazel's
+          # restricted PATH (/bin:/usr/bin:/usr/local/bin) -> "ccache: command not found". Hide it.
+          brew uninstall --ignore-dependencies --force ccache 2>/dev/null || true
+          for p in $(which -a ccache 2>/dev/null); do sudo rm -f "$p"; done
+          which ccache || echo "ccache removed"
+      - name: Submodules
+        script: |
+          git config --global url."https://github.com/TelegramMessenger/rlottie.git".insteadOf "https://github.com/voidzxcdev/rlottie.git"
+          git config --global url."https://github.com/TelegramMessenger/tgcalls.git".insteadOf "https://github.com/voidzxcdev/tgcalls.git"
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1 --jobs 8 || git submodule update --init --recursive --jobs 8
+          git submodule status --recursive | cut -c1-90
+      - name: Restore Bazel disk cache
+        script: |
+          mkdir -p $HOME/bazel-cache $HOME/cmcache
+          if [ -f $HOME/cmcache/bazel-cache.tar.zst ]; then
+            ls -la $HOME/cmcache
+            tar -C $HOME --zstd -xf $HOME/cmcache/bazel-cache.tar.zst && du -sh $HOME/bazel-cache
+          fi
+      - name: Metal toolchain
+        script: |
+          xcrun -f metal 2>/dev/null && xcrun metal --version 2>/dev/null && exit 0
+          for attempt in 1 2 3; do
+            xcodebuild -downloadComponent MetalToolchain || true
+            for i in $(seq 1 12); do
+              xcrun metal --version 2>/dev/null && exit 0
+              echo "metal not ready yet (attempt $attempt, wait $i)"; sleep 10
+            done
+          done
+          xcrun metal --version
+      - name: Prepare configuration
+        script: |
+          python3 - <<'PY'
+          import json, os
+          c = json.load(open('build-system/appstore-configuration.json'))
+          if os.environ.get('TG_API_ID') and os.environ.get('TG_API_HASH'):
+              c['api_id'] = os.environ['TG_API_ID']; c['api_hash'] = os.environ['TG_API_HASH']
+              print('Using api_id/api_hash from TG_API_ID/TG_API_HASH')
+          else:
+              print('WARNING: TG_API_ID/TG_API_HASH not set; using upstream appstore-configuration values')
+          c['enable_siri'] = False
+          c['enable_icloud'] = False
+          json.dump(c, open(os.path.expanduser('~/tg-configuration.json'), 'w'), indent=2)
+          PY
+          cat > $HOME/refresh_profiles.py <<'PYEOF'
+          # Re-issue the upstream fake provisioning profiles with a future ExpirationDate
+          # (upstream's expired 2026-10-30) and re-sign them with fake-codesigning/certs/SelfSigned.p12.
+          import datetime, os, plistlib, shutil, subprocess, sys
+          sys.path.insert(0, 'build-system/Make')
+          import GenerateProfiles as G
+
+          src = 'build-system/fake-codesigning'
+          dst = os.path.expanduser('~/fake-codesigning')
+          shutil.rmtree(dst, ignore_errors=True)
+          shutil.copytree(src, dst)
+          p12 = os.path.join(src, 'certs', 'SelfSigned.p12')
+          identity = G.get_signing_identity_from_p12(p12, '')
+          if not identity:
+              out = subprocess.run(['openssl', 'pkcs12', '-in', p12, '-passin', 'pass:', '-nokeys'], capture_output=True).stdout
+              subj = subprocess.run(['openssl', 'x509', '-noout', '-subject'], input=out, capture_output=True).stdout.decode()
+              identity = subj.split('CN')[-1].lstrip(' =').split(',')[0].split('/')[0].strip()
+          print('identity:', identity)
+          keychain = G.setup_temp_keychain(p12, '')
+          now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None, microsecond=0)
+          try:
+              pdir = os.path.join(dst, 'profiles')
+              for name in sorted(os.listdir(pdir)):
+                  if not name.endswith('.mobileprovision'):
+                      continue
+                  path = os.path.join(pdir, name)
+                  raw = subprocess.run(['security', 'cms', '-D', '-i', path], capture_output=True, check=True).stdout
+                  pl = plistlib.loads(raw)
+                  print(name, 'old expiry', pl.get('ExpirationDate'))
+                  pl['CreationDate'] = now - datetime.timedelta(days=1)
+                  pl['ExpirationDate'] = now + datetime.timedelta(days=365)
+                  pl['TimeToLive'] = 366
+                  pl.pop('DER-Encoded-Profile', None)
+                  tmp = path + '.plist'
+                  with open(tmp, 'wb') as f:
+                      plistlib.dump(pl, f)
+                  subprocess.run(['security', 'cms', '-S', '-k', keychain, '-N', identity, '-i', tmp, '-o', path], check=True)
+                  os.unlink(tmp)
+                  chk = plistlib.loads(subprocess.run(['security', 'cms', '-D', '-i', path], capture_output=True, check=True).stdout)
+                  print(name, 'new expiry', chk['ExpirationDate'])
+          finally:
+              G.cleanup_temp_keychain(keychain)
+          PYEOF
+          python3 $HOME/refresh_profiles.py
+          # Import certs AFTER re-issuing profiles: GenerateProfiles' temp keychain resets the search list.
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          security list-keychains -d user
+          security find-identity -p codesigning | tee $HOME/identities.txt
+          security cms -D -i $HOME/fake-codesigning/profiles/Telegram.mobileprovision > $HOME/tp.plist
+          python3 - <<'PY2'
+          import plistlib, hashlib, os, sys
+          pl = plistlib.load(open(os.path.expanduser('~/tp.plist'), 'rb'))
+          ids = open(os.path.expanduser('~/identities.txt')).read()
+          want = [hashlib.sha1(c).hexdigest().upper() for c in pl['DeveloperCertificates']]
+          print('profile cert sha1:', want)
+          if not any(w in ids for w in want):
+              print('ERROR: signing identity for profile not in keychain'); sys.exit(1)
+          print('signing identity OK')
+          PY2
+      - name: Build
+        script: |
+          set -x
+          BUILD_NUMBER=$(( $(cat build_number_offset) + 100000 + ${BUILD_NUMBER:-0} ))
+          echo "TG_BUILD_NUMBER=$BUILD_NUMBER" >> $CM_ENV
+          python3 -u build-system/Make/Make.py \
+            --cacheDir="$HOME/bazel-cache" \
+            build \
+            --configurationPath="$HOME/tg-configuration.json" \
+            --codesigningInformationPath="$HOME/fake-codesigning" \
+            --configuration="$BUILD_CONFIGURATION" \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath="$PWD/build/artifacts" > $HOME/bazel-build.log 2>&1 &
+          PID=$!
+          ELAPSED_MIN=$(( ($(date +%s) - BUILD_START) / 60 ))
+          LEFT=$(( BAZEL_BUDGET_MIN - ELAPSED_MIN ))
+          echo "bazel budget left: ${LEFT} min"
+          tail -f $HOME/bazel-build.log &
+          TAILPID=$!
+          END=$(( $(date +%s) + LEFT * 60 ))
+          while kill -0 $PID 2>/dev/null; do
+            if [ $(date +%s) -ge $END ]; then
+              echo "TGPLUS: budget reached, stopping bazel to save cache (partial build)"
+              pkill -INT -f "build-input/bazel-" || true
+              for i in $(seq 1 12); do kill -0 $PID 2>/dev/null || break; sleep 10; done
+              kill $PID 2>/dev/null || true
+              echo "TGPLUS_PARTIAL=1" >> $CM_ENV
+              break
+            fi
+            sleep 15
+          done
+          wait $PID; RC=$?
+          kill $TAILPID 2>/dev/null || true
+          echo "Make.py exit code: $RC"
+          grep -E "processes:|Elapsed time|INFO: Build completed|ERROR" $HOME/bazel-build.log | tail -20
+          if [ -f build/artifacts/Telegram.ipa ]; then exit 0; fi
+          if grep -q "TGPLUS_PARTIAL=1" $CM_ENV 2>/dev/null; then exit 0; fi
+          # Bazel failed: keep the workflow green so Codemagic still persists the disk cache
+          # (cache is only saved on successful builds); the failure is reported via TGPLUS_FAILED.
+          echo "TGPLUS_FAILED=1" >> $CM_ENV
+          echo "TGPLUS: BAZEL BUILD FAILED (see errors above); continuing only to save cache"
+          exit 0
+      - name: Save Bazel disk cache
+        script: |
+          du -sh $HOME/bazel-cache || true
+          rm -f $HOME/cmcache/bazel-cache.tar.zst
+          tar -C $HOME --zstd -cf $HOME/cmcache/bazel-cache.tar.zst bazel-cache
+          ls -la $HOME/cmcache
+      - name: Package IPAs
+        script: |
+          set -x
+          [ -f build/artifacts/Telegram.ipa ] || { echo "No IPA (partial build). Re-run to continue from cache."; exit 0; }
+          cd build/artifacts
+          mv Telegram.ipa TGPlus-iOS-full.ipa
+          rm -rf work && mkdir work && cd work
+          unzip -q ../TGPlus-iOS-full.ipa
+          ls Payload/Telegram.app/PlugIns || true
+          ls Payload/Telegram.app/Watch || true
+          rm -rf Payload/Telegram.app/PlugIns Payload/Telegram.app/Watch Payload/Telegram.app/Extensions
+          zip -qry ../TGPlus-iOS-noext.ipa Payload
+          cd .. && rm -rf work
+          shasum -a 256 *.ipa | tee SHA256SUMS.txt
+          ls -la
+    artifacts:
+      - build/artifacts/*.ipa
+      - build/artifacts/SHA256SUMS.txt

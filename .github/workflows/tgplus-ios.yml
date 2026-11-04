@@ -1,0 +1,145 @@
+name: TGPlus iOS unsigned IPA
+
+on:
+  push:
+    branches: [ 'tgplus-ios/build' ]
+    paths: [ '.github/workflows/tgplus-ios.yml' ]
+  workflow_dispatch:
+
+concurrency:
+  group: tgplus-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # macOS arm64 runners (xcode-27, macos-26) were never acquired ("capacity constraints"),
+    # so build upstream 13.0.1 (14a2ebfc46, versions.json: Xcode 26.6) on the Intel macOS 26 runner.
+    runs-on: macos-26-intel
+    env:
+      UPSTREAM_REF: 14a2ebfc4632055855d49926e31f2b0c6d6e8edc
+      XCODE_APP: /Applications/Xcode_26.6.app
+    timeout-minutes: 355
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          # Keep only the selected Xcode; drop other Xcodes and unused simulator runtimes.
+          for x in /Applications/Xcode_*.app; do
+            real=$(cd "$x" && pwd -P)
+            keep=$(cd "$XCODE_APP" && pwd -P)
+            case "$real" in "$keep") ;; *) echo "removing $x"; sudo rm -rf "$x" ;; esac
+          done
+          sudo rm -rf ~/Library/Android /usr/local/share/dotnet ~/.dotnet ~/.ghcup /usr/local/lib/node_modules \
+            ~/Library/Developer/CoreSimulator/Caches /Library/Developer/CoreSimulator/Images 2>/dev/null || true
+          df -h /
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          sysctl -n hw.ncpu hw.memsize
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.UPSTREAM_REF }}
+          submodules: false
+          fetch-depth: 1
+
+      - name: Checkout submodules
+        run: |
+          # Relative submodule URLs (../rlottie.git, ../tgcalls.git) would resolve to this fork.
+          git config --global url."https://github.com/TelegramMessenger/rlottie.git".insteadOf "https://github.com/${{ github.repository_owner }}/rlottie.git"
+          git config --global url."https://github.com/TelegramMessenger/tgcalls.git".insteadOf "https://github.com/${{ github.repository_owner }}/tgcalls.git"
+          sed -i '' 's#url=../rlottie.git#url=https://github.com/TelegramMessenger/rlottie.git#; s#url=../tgcalls.git#url=https://github.com/TelegramMessenger/tgcalls.git#' .gitmodules
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth 1 --jobs 8 || git submodule update --init --recursive --jobs 8
+          git checkout -- .gitmodules
+          git submodule status --recursive | head -50
+          df -h /
+
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/bazel-cache
+          key: tgios-bazel-${{ hashFiles('versions.json') }}-${{ github.sha }}
+          restore-keys: |
+            tgios-bazel-${{ hashFiles('versions.json') }}-
+
+      - name: Prepare configuration
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          c = json.load(open('build-system/appstore-configuration.json'))
+          if os.environ.get('TG_API_ID') and os.environ.get('TG_API_HASH'):
+              c['api_id'] = os.environ['TG_API_ID']; c['api_hash'] = os.environ['TG_API_HASH']
+              print('Using api_id/api_hash from repository secrets')
+          else:
+              print('WARNING: TG_API_ID/TG_API_HASH secrets not set; using upstream appstore-configuration values')
+          # Free Apple IDs cannot sign Siri/iCloud capabilities.
+          c['enable_siri'] = False
+          c['enable_icloud'] = False
+          json.dump(c, open(os.path.expanduser('~/tg-configuration.json'), 'w'), indent=2)
+          PY
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+      - name: Build Telegram.ipa (release_arm64, fake codesigning)
+        id: build
+        timeout-minutes: 320
+        run: |
+          set -x
+          BUILD_NUMBER=$(( $(cat build_number_offset) + 100000 + ${{ github.run_number }} ))
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
+          echo "APP_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["app"])')" >> $GITHUB_ENV
+          mkdir -p "$HOME/bazel-cache"
+          # Make.py only pins the arm64 bazel SHA, so fetch the host-arch binary ourselves.
+          BAZEL_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["bazel"].split(":")[0])')
+          case "$(uname -m)" in arm64) BARCH=darwin-arm64 ;; *) BARCH=darwin-x86_64 ;; esac
+          curl -fsSL -o "$HOME/bazel" "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-$BARCH"
+          chmod +x "$HOME/bazel" && "$HOME/bazel" --version
+          python3 -u build-system/Make/Make.py \
+            --bazel="$HOME/bazel" \
+            --cacheDir="$HOME/bazel-cache" \
+            build \
+            --configurationPath="$HOME/tg-configuration.json" \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath="$PWD/build/artifacts"
+          ls -la build/artifacts
+
+      - name: Save Bazel cache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/bazel-cache
+          key: tgios-bazel-${{ hashFiles('versions.json') }}-${{ github.sha }}-${{ github.run_attempt }}
+
+      - name: Package IPAs (full + no extensions)
+        if: steps.build.outcome == 'success'
+        run: |
+          set -x
+          cd build/artifacts
+          mv Telegram.ipa TGPlus-iOS-full.ipa
+          rm -rf work && mkdir work && cd work
+          unzip -q ../TGPlus-iOS-full.ipa
+          ls Payload/Telegram.app/PlugIns || true
+          ls Payload/Telegram.app/Watch || true
+          rm -rf Payload/Telegram.app/PlugIns Payload/Telegram.app/Watch Payload/Telegram.app/Extensions
+          zip -qry ../TGPlus-iOS-noext.ipa Payload
+          cd .. && rm -rf work
+          shasum -a 256 *.ipa | tee SHA256SUMS.txt
+          ls -la
+
+      - name: Upload IPA artifact
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TGPlus-iOS-${{ env.APP_VERSION }}-${{ env.BUILD_NUMBER }}
+          path: |
+            build/artifacts/*.ipa
+            build/artifacts/SHA256SUMS.txt
+          compression-level: 0
+          retention-days: 30
